@@ -16,6 +16,28 @@ import (
 	"github.com/grafov/m3u8"
 )
 
+func TestImageMimeType(t *testing.T) {
+	tests := []struct {
+		url  string
+		want string
+	}{
+		{"https://cdn.example.com/image.jpg", "image/jpeg"},
+		{"https://cdn.example.com/image.jpeg", "image/jpeg"},
+		{"https://cdn.example.com/image.png", "image/png"},
+		{"https://cdn.example.com/image.webp", "image/webp"},
+		{"https://cdn.example.com/image.gif", "image/jpeg"}, // unsupported falls back to jpeg
+		{"https://cdn.example.com/noextension", "image/jpeg"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			if got := imageMimeType(tt.url); got != tt.want {
+				t.Errorf("imageMimeType(%q) = %q, want %q", tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSanitizeFilename(t *testing.T) {
 	tests := []struct {
 		name  string

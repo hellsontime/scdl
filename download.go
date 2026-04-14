@@ -245,6 +245,14 @@ func (c *Client) embedMetadata(ctx context.Context, filePath string, track *Trac
 	tag.SetArtist(track.Artist)
 	tag.SetGenre(track.Genre)
 
+	if track.Album != "" {
+		tag.SetAlbum(track.Album)
+	}
+
+	if track.Year != "" {
+		tag.SetYear(track.Year)
+	}
+
 	if track.Description != "" {
 		tag.AddCommentFrame(id3v2.CommentFrame{
 			Encoding:    id3v2.EncodingUTF8,
@@ -257,17 +265,40 @@ func (c *Client) embedMetadata(ctx context.Context, filePath string, track *Trac
 	if track.ArtworkURL != "" {
 		artworkURL := strings.Replace(track.ArtworkURL, "-large.", "-t500x500.", 1)
 		image, err := c.get(ctx, artworkURL)
+		finalArtworkURL := artworkURL
 		if (err != nil || len(image) == 0) && artworkURL != track.ArtworkURL {
 			// Fallback to original URL if high-res fails and we changed it
 			image, err = c.get(ctx, track.ArtworkURL)
+			finalArtworkURL = track.ArtworkURL
 		}
 
 		if err == nil && len(image) > 0 {
 			tag.AddAttachedPicture(id3v2.PictureFrame{
 				Encoding:    id3v2.EncodingUTF8,
-				MimeType:    "image/jpeg",
+				MimeType:    imageMimeType(finalArtworkURL),
 				PictureType: id3v2.PTFrontCover,
 				Description: "Front cover",
+				Picture:     image,
+			})
+		}
+	}
+
+	if track.ArtistAvatarURL != "" {
+		artistURL := strings.Replace(track.ArtistAvatarURL, "-large.", "-t500x500.", 1)
+		image, err := c.get(ctx, artistURL)
+		finalArtistURL := artistURL
+		if (err != nil || len(image) == 0) && artistURL != track.ArtistAvatarURL {
+			// Fallback to original URL if high-res fails and we changed it
+			image, err = c.get(ctx, track.ArtistAvatarURL)
+			finalArtistURL = track.ArtistAvatarURL
+		}
+
+		if err == nil && len(image) > 0 {
+			tag.AddAttachedPicture(id3v2.PictureFrame{
+				Encoding:    id3v2.EncodingUTF8,
+				MimeType:    imageMimeType(finalArtistURL),
+				PictureType: id3v2.PTArtistPerformer,
+				Description: "Artist",
 				Picture:     image,
 			})
 		}
@@ -285,6 +316,22 @@ func resolveURI(base *url.URL, uri string) (string, error) {
 		return "", err
 	}
 	return ref.String(), nil
+}
+
+var imageExtMimeTypes = map[string]string{
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".webp": "image/webp",
+}
+
+func imageMimeType(url string) string {
+	for ext, mime := range imageExtMimeTypes {
+		if strings.HasSuffix(url, ext) {
+			return mime
+		}
+	}
+	return "image/jpeg"
 }
 
 func sanitizeFilename(name string) string {
