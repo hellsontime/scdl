@@ -3,6 +3,7 @@ module github.com/hellsontime/scdl
 go 1.26
 
 require (
+	github.com/Eyevinn/mp4ff v0.62.1
 	github.com/bogem/id3v2/v2 v2.1.4
 	github.com/grafov/m3u8 v0.12.1
 	github.com/urfave/cli/v2 v2.27.7

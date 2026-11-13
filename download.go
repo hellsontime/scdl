@@ -22,7 +22,8 @@ import (
 
 const maxConcurrentSegments = 20
 
-// Download fetches the track audio via HLS and saves it as an MP3 with ID3 tags.
+// Download fetches the track audio via HLS and saves it as an MP3 with ID3 tags
+// or, for AAC streams, as an M4A with iTunes-style tags.
 // Returns the output file path.
 func (c *Client) Download(ctx context.Context, track *Track, outputDir string, progress func(downloaded, total int)) (outPath string, err error) {
 	m3u8URL, err := c.GetStreamURL(ctx, track)
@@ -42,7 +43,43 @@ func (c *Client) Download(ctx context.Context, track *Track, outputDir string, p
 	if segCount > math.MaxInt {
 		return "", fmt.Errorf("playlist too large")
 	}
-	count := int(segCount) //nolint:gosec // bounds checked above
+
+	// Fragmented MP4 streams carry their codec setup in a separate init segment.
+	var initSegment []byte
+	if track.Format == FormatAAC {
+		if mpl.Map == nil || mpl.Map.URI == "" {
+			return "", fmt.Errorf("no init segment in playlist")
+		}
+		initSegment, err = c.get(ctx, mpl.Map.URI)
+		if err != nil {
+			return "", fmt.Errorf("download init segment: %w", err)
+		}
+	}
+
+	segments, err := c.downloadSegments(ctx, mpl, progress)
+	if err != nil {
+		return "", err
+	}
+
+	filename := sanitizeFilename(track.Artist+" - "+track.Title) + track.Format.Ext()
+	outPath = filepath.Clean(filepath.Join(outputDir, filename))
+
+	if track.Format == FormatAAC {
+		err = c.writeM4A(ctx, outPath, initSegment, segments, track)
+	} else {
+		err = c.writeMP3(ctx, outPath, segments, track)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	return outPath, nil
+}
+
+// downloadSegments fetches and decrypts all media segments of the playlist
+// concurrently, returning them in playlist order.
+func (c *Client) downloadSegments(ctx context.Context, mpl *m3u8.MediaPlaylist, progress func(downloaded, total int)) ([][]byte, error) {
+	count := int(mpl.Count()) //nolint:gosec // bounds checked in Download
 
 	segments := make([][]byte, count)
 	var keyCache sync.Map
@@ -82,32 +119,34 @@ func (c *Client) Download(ctx context.Context, track *Track, outputDir string, p
 	}
 
 	if err := g.Wait(); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	filename := sanitizeFilename(track.Artist+" - "+track.Title) + ".mp3"
-	outPath = filepath.Clean(filepath.Join(outputDir, filename))
+	return segments, nil
+}
 
+// writeMP3 concatenates the MPEG audio segments into outPath and tags it with ID3.
+func (c *Client) writeMP3(ctx context.Context, outPath string, segments [][]byte, track *Track) error {
 	f, err := os.Create(outPath) //nolint:gosec // user controls output path
 	if err != nil {
-		return "", fmt.Errorf("create output file: %w", err)
+		return fmt.Errorf("create output file: %w", err)
 	}
 
 	for _, seg := range segments {
 		if _, err := f.Write(seg); err != nil {
 			_ = f.Close()
-			return "", fmt.Errorf("write segment: %w", err)
+			return fmt.Errorf("write segment: %w", err)
 		}
 	}
 	if err := f.Close(); err != nil {
-		return "", fmt.Errorf("close output file: %w", err)
+		return fmt.Errorf("close output file: %w", err)
 	}
 
 	if err := c.embedMetadata(ctx, outPath, track); err != nil {
-		return "", fmt.Errorf("embed metadata: %w", err)
+		return fmt.Errorf("embed metadata: %w", err)
 	}
 
-	return outPath, nil
+	return nil
 }
 
 func (c *Client) parseM3U8(ctx context.Context, m3u8URL string) (*m3u8.MediaPlaylist, error) {
@@ -130,6 +169,13 @@ func (c *Client) parseM3U8(ctx context.Context, m3u8URL string) (*m3u8.MediaPlay
 
 	if mpl.Key != nil && mpl.Key.URI != "" {
 		mpl.Key.URI, err = resolveURI(base, mpl.Key.URI)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if mpl.Map != nil && mpl.Map.URI != "" {
+		mpl.Map.URI, err = resolveURI(base, mpl.Map.URI)
 		if err != nil {
 			return nil, err
 		}
@@ -262,49 +308,50 @@ func (c *Client) embedMetadata(ctx context.Context, filePath string, track *Trac
 		})
 	}
 
-	if track.ArtworkURL != "" {
-		artworkURL := strings.Replace(track.ArtworkURL, "-large.", "-t500x500.", 1)
-		image, err := c.get(ctx, artworkURL)
-		finalArtworkURL := artworkURL
-		if (err != nil || len(image) == 0) && artworkURL != track.ArtworkURL {
-			// Fallback to original URL if high-res fails and we changed it
-			image, err = c.get(ctx, track.ArtworkURL)
-			finalArtworkURL = track.ArtworkURL
-		}
-
-		if err == nil && len(image) > 0 {
-			tag.AddAttachedPicture(id3v2.PictureFrame{
-				Encoding:    id3v2.EncodingUTF8,
-				MimeType:    imageMimeType(finalArtworkURL),
-				PictureType: id3v2.PTFrontCover,
-				Description: "Front cover",
-				Picture:     image,
-			})
-		}
+	if image, mimeType := c.fetchImage(ctx, track.ArtworkURL); image != nil {
+		tag.AddAttachedPicture(id3v2.PictureFrame{
+			Encoding:    id3v2.EncodingUTF8,
+			MimeType:    mimeType,
+			PictureType: id3v2.PTFrontCover,
+			Description: "Front cover",
+			Picture:     image,
+		})
 	}
 
-	if track.ArtistAvatarURL != "" {
-		artistURL := strings.Replace(track.ArtistAvatarURL, "-large.", "-t500x500.", 1)
-		image, err := c.get(ctx, artistURL)
-		finalArtistURL := artistURL
-		if (err != nil || len(image) == 0) && artistURL != track.ArtistAvatarURL {
-			// Fallback to original URL if high-res fails and we changed it
-			image, err = c.get(ctx, track.ArtistAvatarURL)
-			finalArtistURL = track.ArtistAvatarURL
-		}
-
-		if err == nil && len(image) > 0 {
-			tag.AddAttachedPicture(id3v2.PictureFrame{
-				Encoding:    id3v2.EncodingUTF8,
-				MimeType:    imageMimeType(finalArtistURL),
-				PictureType: id3v2.PTArtistPerformer,
-				Description: "Artist",
-				Picture:     image,
-			})
-		}
+	if image, mimeType := c.fetchImage(ctx, track.ArtistAvatarURL); image != nil {
+		tag.AddAttachedPicture(id3v2.PictureFrame{
+			Encoding:    id3v2.EncodingUTF8,
+			MimeType:    mimeType,
+			PictureType: id3v2.PTArtistPerformer,
+			Description: "Artist",
+			Picture:     image,
+		})
 	}
 
 	return tag.Save()
+}
+
+// fetchImage downloads a SoundCloud image, preferring its 500x500 variant and
+// falling back to the original URL. It returns nil if the URL is empty or
+// neither variant can be fetched.
+func (c *Client) fetchImage(ctx context.Context, imageURL string) (image []byte, mimeType string) {
+	if imageURL == "" {
+		return nil, ""
+	}
+
+	hiResURL := strings.Replace(imageURL, "-large.", "-t500x500.", 1)
+	image, err := c.get(ctx, hiResURL)
+	finalURL := hiResURL
+	if (err != nil || len(image) == 0) && hiResURL != imageURL {
+		// Fallback to original URL if high-res fails and we changed it
+		image, err = c.get(ctx, imageURL)
+		finalURL = imageURL
+	}
+
+	if err != nil || len(image) == 0 {
+		return nil, ""
+	}
+	return image, imageMimeType(finalURL)
 }
 
 func resolveURI(base *url.URL, uri string) (string, error) {
@@ -318,10 +365,15 @@ func resolveURI(base *url.URL, uri string) (string, error) {
 	return ref.String(), nil
 }
 
+const (
+	mimeJPEG = "image/jpeg"
+	mimePNG  = "image/png"
+)
+
 var imageExtMimeTypes = map[string]string{
-	".jpg":  "image/jpeg",
-	".jpeg": "image/jpeg",
-	".png":  "image/png",
+	".jpg":  mimeJPEG,
+	".jpeg": mimeJPEG,
+	".png":  mimePNG,
 	".webp": "image/webp",
 }
 
@@ -331,7 +383,7 @@ func imageMimeType(url string) string {
 			return mime
 		}
 	}
-	return "image/jpeg"
+	return mimeJPEG
 }
 
 func sanitizeFilename(name string) string {

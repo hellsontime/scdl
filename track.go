@@ -22,7 +22,58 @@ type Track struct {
 	Year               string
 	Duration           int // milliseconds
 	TrackAuthorization string
-	HLSURL             string // HLS transcoding URL for audio/mpeg
+	HLSURL             string      // HLS transcoding URL
+	Format             AudioFormat // audio format served at HLSURL
+}
+
+// AudioFormat identifies the audio format of a track's HLS stream.
+type AudioFormat int
+
+const (
+	// FormatMP3 is an MP3 stream, saved as .mp3 with ID3 tags.
+	FormatMP3 AudioFormat = iota
+	// FormatAAC is an AAC stream in fragmented MP4, saved as .m4a with iTunes-style tags.
+	FormatAAC
+)
+
+// Ext returns the file extension used when saving the format.
+func (f AudioFormat) Ext() string {
+	if f == FormatAAC {
+		return ".m4a"
+	}
+	return ".mp3"
+}
+
+type transcoding struct {
+	URL    string `json:"url"`
+	Preset string `json:"preset"`
+	Format struct {
+		Protocol string `json:"protocol"`
+		MimeType string `json:"mime_type"`
+	} `json:"format"`
+}
+
+// selectTranscoding picks the HLS stream to download. MP3 is preferred; AAC is
+// the fallback for tracks SoundCloud no longer serves as MP3, preferring the
+// 160 kbps preset when several AAC streams exist.
+func selectTranscoding(transcodings []transcoding) (string, AudioFormat, error) {
+	var aacURL string
+	for _, t := range transcodings {
+		if t.Format.Protocol != "hls" {
+			continue
+		}
+		switch {
+		case t.Format.MimeType == "audio/mpeg":
+			return t.URL, FormatMP3, nil
+		case strings.HasPrefix(t.Format.MimeType, "audio/mp4") && (aacURL == "" || t.Preset == "aac_160k"):
+			aacURL = t.URL
+		}
+	}
+
+	if aacURL == "" {
+		return "", 0, fmt.Errorf("no supported HLS transcoding found (MP3 or AAC)")
+	}
+	return aacURL, FormatAAC, nil
 }
 
 var hydrationRe = regexp.MustCompile(`window\.__sc_hydration\s*=\s*(\[.+?]);`)
@@ -67,15 +118,15 @@ func (c *Client) GetTrack(ctx context.Context, trackURL string) (*Track, error) 
 		}
 
 		var data struct {
-			ID                 int       `json:"id"`
-			Title              string    `json:"title"`
+			ID                 int          `json:"id"`
+			Title              string       `json:"title"`
 			CreatedAt          nullableTime `json:"created_at"`
 			ReleaseDate        nullableTime `json:"release_date"`
-			Description        string    `json:"description"`
-			Genre              string    `json:"genre"`
-			Duration           int       `json:"duration"`
-			ArtworkURL         string    `json:"artwork_url"`
-			TrackAuthorization string    `json:"track_authorization"`
+			Description        string       `json:"description"`
+			Genre              string       `json:"genre"`
+			Duration           int          `json:"duration"`
+			ArtworkURL         string       `json:"artwork_url"`
+			TrackAuthorization string       `json:"track_authorization"`
 			PublisherMetadata  struct {
 				Artist       string `json:"artist"`
 				AlbumTitle   string `json:"album_title"`
@@ -86,13 +137,7 @@ func (c *Client) GetTrack(ctx context.Context, trackURL string) (*Track, error) 
 				Username  string `json:"username"`
 			} `json:"user"`
 			Media struct {
-				Transcodings []struct {
-					URL    string `json:"url"`
-					Format struct {
-						Protocol string `json:"protocol"`
-						MimeType string `json:"mime_type"`
-					} `json:"format"`
-				} `json:"transcodings"`
+				Transcodings []transcoding `json:"transcodings"`
 			} `json:"media"`
 		}
 		if err := json.Unmarshal(entry.Data, &data); err != nil {
@@ -132,15 +177,9 @@ func (c *Client) GetTrack(ctx context.Context, trackURL string) (*Track, error) 
 			TrackAuthorization: data.TrackAuthorization,
 		}
 
-		for _, t := range data.Media.Transcodings {
-			if t.Format.MimeType == "audio/mpeg" && t.Format.Protocol == "hls" {
-				track.HLSURL = t.URL
-				break
-			}
-		}
-
-		if track.HLSURL == "" {
-			return nil, fmt.Errorf("no HLS audio/mpeg transcoding found")
+		track.HLSURL, track.Format, err = selectTranscoding(data.Media.Transcodings)
+		if err != nil {
+			return nil, err
 		}
 
 		return track, nil
