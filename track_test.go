@@ -61,6 +61,85 @@ func TestGetTrack(t *testing.T) {
 	if track.HLSURL != "https://api-v2.soundcloud.com/media/soundcloud:tracks:123456/stream/hls" {
 		t.Errorf("got HLSURL %q, want %q", track.HLSURL, "https://api-v2.soundcloud.com/media/soundcloud:tracks:123456/stream/hls")
 	}
+	if track.Format != FormatMP3 {
+		t.Errorf("got Format %v, want FormatMP3", track.Format)
+	}
+}
+
+func TestSelectTranscoding(t *testing.T) {
+	tc := func(url, protocol, mimeType, preset string) transcoding {
+		var t transcoding
+		t.URL, t.Preset, t.Format.Protocol, t.Format.MimeType = url, preset, protocol, mimeType
+		return t
+	}
+	aacMime := `audio/mp4; codecs="mp4a.40.2"`
+
+	tests := []struct {
+		name         string
+		transcodings []transcoding
+		wantURL      string
+		wantFormat   AudioFormat
+		wantErr      bool
+	}{
+		{
+			name: "MP3 preferred over AAC",
+			transcodings: []transcoding{
+				tc("aac", "hls", aacMime, "aac_160k"),
+				tc("mp3", "hls", "audio/mpeg", "mp3_1_0"),
+			},
+			wantURL:    "mp3",
+			wantFormat: FormatMP3,
+		},
+		{
+			name: "AAC fallback prefers 160k",
+			transcodings: []transcoding{
+				tc("aac96", "hls", aacMime, "aac_96k"),
+				tc("abr", "hls", "audio/mpegurl", "abr_sq"),
+				tc("aac160", "hls", aacMime, "aac_160k"),
+			},
+			wantURL:    "aac160",
+			wantFormat: FormatAAC,
+		},
+		{
+			name: "AAC fallback takes first when no 160k",
+			transcodings: []transcoding{
+				tc("aac96", "hls", aacMime, "aac_96k"),
+				tc("aac64", "hls", aacMime, "aac_64k"),
+			},
+			wantURL:    "aac96",
+			wantFormat: FormatAAC,
+		},
+		{
+			name: "Progressive and unsupported ignored",
+			transcodings: []transcoding{
+				tc("prog", "progressive", "audio/mpeg", "mp3_0_0"),
+				tc("abr", "hls", "audio/mpegurl", "abr_sq"),
+				tc("opus", "hls", `audio/ogg; codecs="opus"`, "opus_0_0"),
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url, format, err := selectTranscoding(tt.transcodings)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if url != tt.wantURL || format != tt.wantFormat {
+				t.Errorf("got (%q, %v), want (%q, %v)", url, format, tt.wantURL, tt.wantFormat)
+			}
+		})
+	}
+}
+
+func TestAudioFormatExt(t *testing.T) {
+	if got := FormatMP3.Ext(); got != ".mp3" {
+		t.Errorf("FormatMP3.Ext() = %q", got)
+	}
+	if got := FormatAAC.Ext(); got != ".m4a" {
+		t.Errorf("FormatAAC.Ext() = %q", got)
+	}
 }
 func TestGetTrack_Errors(t *testing.T) {
 	client := &Client{
@@ -135,7 +214,7 @@ func TestGetTrack_Errors(t *testing.T) {
 
 	t.Run("NoHLS", func(t *testing.T) {
 		_, err := client.GetTrack(context.Background(), "http://no-hls")
-		if err == nil || !strings.Contains(err.Error(), "no HLS audio/mpeg transcoding found") {
+		if err == nil || !strings.Contains(err.Error(), "no supported HLS transcoding found") {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
